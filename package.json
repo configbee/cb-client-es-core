@@ -1,0 +1,45 @@
+{
+  "name": "configbee-client-core",
+  "version": "0.0.2-alpha.1",
+  "description": "",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "browser": "dist/cb-client-core.min.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:node": "tsc",
+    "build:browser": "rollup --bundleConfigAsCjs -c",
+    "build:both": "npm run build:node && npm run build:browser",
+    "dev-build": "rm -rf dist && cp envs/dev.ts src/Config.ts && npm run build:both",
+    "prod-build": "rm -rf dist && cp envs/prod.ts src/Config.ts && npm run build:both",
+    "build-and-publish-alpha": "npm run prod-build && npm publish --tag alpha",
+    "test": "jest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/configbee/cb-client-es-core.git"
+  },
+  "author": "",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/configbee/cb-client-es-core/issues"
+  },
+  "homepage": "https://github.com/configbee/cb-client-es-core#readme",
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^11.1.5",
+    "@types/jest": "^29.5.5",
+    "jest": "^29.7.0",
+    "rollup": "^4.0.2",
+    "rollup-plugin-babel-minify": "^10.0.0",
+    "rollup-plugin-commonjs": "^10.1.0",
+    "rollup-plugin-node-resolve": "^5.2.0",
+    "ts-jest": "^29.1.1",
+    "tslib": "^2.6.2",
+    "typescript": "^5.2.2"
+  },
+  "dependencies": {
+    "event-source-polyfill": "^1.0.31"
+  }
+}
