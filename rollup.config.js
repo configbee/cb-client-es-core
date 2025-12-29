@@ -1,6 +1,6 @@
 import typescript from '@rollup/plugin-typescript';
-import nodeResolve from 'rollup-plugin-node-resolve';
-import minify from 'rollup-plugin-babel-minify';
+import { nodeResolve } from '@rollup/plugin-node-resolve';
+import terser from '@rollup/plugin-terser';
 import pkg from './package.json'
 
 export default {
@@ -14,6 +14,6 @@ export default {
   plugins: [
     nodeResolve({ preferBuiltins: true, browser: true }),
     typescript(),
-    minify({ comments: false }),
+    terser(),
   ]
 };

@@ -45,7 +45,10 @@ const getStorage = () =>{
             global.localStorage = {
                 getItem:function(key){return global.localStorageMap.get(key)},
                 setItem:function(key,value){global.localStorageMap.set(key,value)},
-                removeItem:function(key){global.localStorageMap.delete(key)}
+                removeItem:function(key){global.localStorageMap.delete(key)},
+                length: undefined,
+                clear: undefined,
+                key: undefined,
             }
         }
         return global.localStorage
