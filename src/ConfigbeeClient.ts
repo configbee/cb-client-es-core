@@ -1,8 +1,11 @@
 import Config from "./Config";
+import { SDK_VERSION } from "./version";
+import { isInPercentageBucket } from "./utils/percentageBucketing";
 
 declare var localStorage: any;
 declare var navigator: any;
 declare var EventSource: any;
+declare var window: any;
 
 const wait = ms => new Promise(res => setTimeout(res, ms));
 
@@ -67,6 +70,47 @@ const getSSEventSource = (url: string) => {
     }
     return new LocalEventSource(url)
 }
+
+const generateVisitorId = () => {
+    const timestamp = Date.now().toString(36);
+    let randomString: string;
+    try {
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        const randomArray = new Uint8Array(32);
+        const c = (typeof window !== 'undefined' && window.crypto) ? window.crypto : require('crypto');
+        c.getRandomValues(randomArray);
+        randomString = Array.from(randomArray).map((n: number) => chars[n % chars.length]).join('');
+    } catch {
+        randomString = Math.random().toString(36).substring(2, 12) + Math.random().toString(36).substring(2, 12);
+    }
+    return `${timestamp}-${randomString}`;
+}
+
+const generateUUID = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+})
+
+
+const getVisitorId = (clientKey: string, objKey: string) => {
+    const storage = getStorage();
+    return storage.getItem("__configbee::" + clientKey + "::VisitorId::" + objKey);
+}
+
+const setVisitorId = (clientKey: string, objKey: string, visitorId: string) => {
+    const storage = getStorage();
+    storage.setItem("__configbee::" + clientKey + "::VisitorId::" + objKey, visitorId);
+}
+
+const getOrCreateVisitorId = (clientKey: string, objKey: string) => {
+    let visitorId = getVisitorId(clientKey, objKey);
+    if (!visitorId) {
+        visitorId = generateVisitorId();
+        setVisitorId(clientKey, objKey, visitorId);
+    }
+    return visitorId;
+}
+
 
 const getDistObjectCurrentVersionId = (clientKey:string, objKey:string) => {
     const storage = getStorage()
@@ -181,6 +225,32 @@ export namespace ConfigbeeClient {
     interface DistributionObjContent {
         [key: string]: FlagOptionData | NumberOptionData | TextOptionData | JsonOptionData
     }
+    interface ContextAssignment { key: string, value: string }
+    interface PercentageHashModifier {
+        type: "PERCENTAGE_HASH"
+        args: { percentage: number, hashInput: "VISITOR"|"ASSIGNMENT"|(string & {}) /* (string & {}) prevents union collapse, preserving IDE autocomplete for known values */, assignmentKey?: string, salt?: string }
+        content?: DistributionObjContent
+    }
+    interface AssignmentMatchModifier {
+        type: "ASSIGNMENT_MATCH"
+        args: { "key"?: string, "value"?: string, "key-in"?: string[], "value-in"?: string[] }
+        content?: DistributionObjContent
+    }
+    interface MatchAnyModifier {
+        type: "MATCH_ANY"
+        conditions: ContentModifier[]
+        content?: DistributionObjContent
+    }
+    interface MatchAllModifier {
+        type: "MATCH_ALL"
+        conditions: ContentModifier[]
+        content?: DistributionObjContent
+    }
+    type ContentModifier = PercentageHashModifier | AssignmentMatchModifier | MatchAnyModifier | MatchAllModifier | { type: string, args?: any, conditions?: any[], content?: DistributionObjContent }
+    interface ContentModifiers {
+        keys: string[]
+        data: { [key: string]: ContentModifier }
+    }
     interface DistributionObjData {
         key?: string
         meta: {
@@ -188,6 +258,7 @@ export namespace ConfigbeeClient {
             versionTs: string
         }
         content: DistributionObjContent
+        contentModifiers?: ContentModifiers
     }
 
     function combineDistributionObjContent({base, extras}:{base:DistributionObjContent, extras:DistributionObjContent[]}):DistributionObjContent{
@@ -227,6 +298,36 @@ export namespace ConfigbeeClient {
     return combined
     }
 
+
+    function evaluateModifier(modifier: ContentModifier, visitorId: string, contextAssignments: ContextAssignment[]): boolean {
+        switch(modifier.type){
+            case "PERCENTAGE_HASH": {
+                const args = (modifier as PercentageHashModifier).args
+                let input: string | undefined
+                if(args.hashInput === "VISITOR") input = visitorId
+                else if(args.hashInput === "ASSIGNMENT") input = contextAssignments.find(a => a.key === args.assignmentKey)?.value
+                else { console.warn("ConfigBee: unknown hashInput:", args.hashInput); return false }
+                if(input == null) return false
+                return isInPercentageBucket(input, args.percentage, args.salt)
+            }
+            case "ASSIGNMENT_MATCH": {
+                const args = (modifier as AssignmentMatchModifier).args
+                if(args["key"] != null && !contextAssignments.find(a => a.key === args["key"])) return false
+                if(args["value"] != null && contextAssignments.find(a => a.key === args["key"])?.value !== args["value"]) return false
+                if(args["key-in"] != null && !contextAssignments.some(a => args["key-in"].includes(a.key))) return false
+                if(args["value-in"] != null && !args["value-in"].includes(contextAssignments.find(a => a.key === args["key"])?.value)) return false
+                return true
+            }
+            case "MATCH_ANY":
+                return (modifier as MatchAnyModifier).conditions.some(c => evaluateModifier(c, visitorId, contextAssignments))
+            case "MATCH_ALL":
+                return (modifier as MatchAllModifier).conditions.every(c => evaluateModifier(c, visitorId, contextAssignments))
+            default:
+                console.warn("ConfigBee: unknown modifier type:", modifier.type)
+                return false
+        }
+    }
+
     export interface ClientParams{
         accountId?: string
         projectId?: string
@@ -241,6 +342,8 @@ export namespace ConfigbeeClient {
 
         onReady?: Function
         onUpdate?: Function
+        subSdkName?: string
+        subSdkVersion?: string
     }
 
     export class Client{
@@ -266,6 +369,8 @@ export namespace ConfigbeeClient {
         private _sessionStatus: CbStatusType
 
         private readyNotificationPending: boolean = true
+        private _lastTracedServingVersion: string = undefined
+        private _lastTracedSessionVersionHash: string = undefined
 
         private eventBus = new EventEmitter()
 
@@ -274,6 +379,9 @@ export namespace ConfigbeeClient {
         private _sseEventSource: any
         private _sseSource: SSESource
         private _sseKey: string
+        private _visitorId: string
+        private _directBaseUrl: string
+        private _contextAssignments: {key:string, value:string}[] = []
 
         public get status(){
             return this._status
@@ -443,6 +551,7 @@ export namespace ConfigbeeClient {
             }
             
             this.currentTargetProperties = resBody.targetProperties
+            this._contextAssignments = resBody.contextAssignments || []
             
             this.handleConfigGroupsData(resBody.configGroups)
             this.handleTargetingData(resBody.targetingData)
@@ -490,13 +599,27 @@ export namespace ConfigbeeClient {
                         console.error(e)
                     }
                 }
+                const _readyServingVersion = this.getCurrentVersionId() as string
+                const _readySessionVersionHash = getActiveSessionData(this.params.key,this.envKey)?.versionHash
+                this._lastTracedServingVersion = _readyServingVersion
+                this._lastTracedSessionVersionHash = _readySessionVersionHash
+                this.sendTrace([{clientSideId:generateUUID(),clientSideTsMs:Date.now(),type:"client-ready",props:{servingVersion:_readyServingVersion,sessionVersionHash:_readySessionVersionHash}}])
             }
-            else if(this.params.onUpdate!==undefined){
-                try{
-                    this.params.onUpdate()
+            else{
+                if(this.params.onUpdate!==undefined){
+                    try{
+                        this.params.onUpdate()
+                    }
+                    catch (e){
+                        console.error(e)
+                    }
                 }
-                catch (e){
-                    console.error(e)
+                const _updatedServingVersion = this.getCurrentVersionId() as string
+                const _updatedSessionVersionHash = getActiveSessionData(this.params.key,this.envKey)?.versionHash
+                if(_updatedServingVersion !== this._lastTracedServingVersion || _updatedSessionVersionHash !== this._lastTracedSessionVersionHash){
+                    this._lastTracedServingVersion = _updatedServingVersion
+                    this._lastTracedSessionVersionHash = _updatedSessionVersionHash
+                    this.sendTrace([{clientSideId:generateUUID(),clientSideTsMs:Date.now(),type:"client-state-updated",props:{servingVersion:_updatedServingVersion,sessionVersionHash:_updatedSessionVersionHash}}])
                 }
             }
             this._notifiedData = JSON.parse(JSON.stringify(notifyData))
@@ -519,6 +642,7 @@ export namespace ConfigbeeClient {
             this.sessionStatus = "DEACTIVE"
             this.currentTargetProperties = undefined
             this.currentTargetingData = {}
+            this._contextAssignments = []
             if(sessionData?.key){
                 this._previousSessionKey = sessionData.key
             }
@@ -532,17 +656,34 @@ export namespace ConfigbeeClient {
             if(this.status!="ACTIVE"){
                 return
             }
+            const baseObj = this.currentConfigGroupsData.default
+            const contentModifiers = baseObj.contentModifiers
+            const modifierExtras: DistributionObjContent[] = []
+            if(contentModifiers?.keys?.length){
+                for(const key of contentModifiers.keys){
+                    const modifier = contentModifiers.data[key]
+                    if(evaluateModifier(modifier, this._visitorId, this._contextAssignments) && modifier.content){
+                        modifierExtras.push(modifier.content)
+                    }
+                }
+            }
             if(this.isSessionActive()){
                 const targetDistributionKeys = this.currentTargetingData.default?.distributionKeys || []
                 const distributionData = this.currentTargetingData.default.distributionData
-                const extras = targetDistributionKeys.map(item=>distributionData[item]?.content).filter(item=>item!=undefined)
+                const targetingExtras = targetDistributionKeys.map(item=>distributionData[item]?.content).filter(item=>item!=undefined)
                 return combineDistributionObjContent({
-                    base: this.currentConfigGroupsData.default.content,
-                    extras: extras
+                    base: baseObj.content,
+                    extras: [...modifierExtras, ...targetingExtras]
+                })
+            }
+            else if(modifierExtras.length){
+                return combineDistributionObjContent({
+                    base: baseObj.content,
+                    extras: modifierExtras
                 })
             }
             else{
-                return this.currentConfigGroupsData.default.content
+                return baseObj.content
             }
         }
 
@@ -664,6 +805,7 @@ export namespace ConfigbeeClient {
             }
             const es = getSSEventSource(ssePath)
             this._sseEventSource = es
+            es.addEventListener("open", () => this.sendTrace([{clientSideId:generateUUID(),clientSideTsMs:Date.now(),type:"stream-connected",props:{}}]))
 
             for(const eachEventName of ["updated","found", "session-found", "session-updated"]){
                 es.addEventListener(eachEventName, (event)=>this.handleSSEvent({event:event, source:source}))
@@ -714,6 +856,7 @@ export namespace ConfigbeeClient {
         private async runSSESource({key, source}:{key: string, source:SSESource}){
             this._sseSource = source
             this._sseKey = key
+            this._directBaseUrl = source.fetchBaseUrls.direct
             const sessionFlow = async ():Promise<"SUCCESS"|"ERROR"> => {
                 if(this.isSessionRequired()){
                     try{
@@ -775,17 +918,41 @@ export namespace ConfigbeeClient {
             } while (true);
         }
 
-        private getHttpPath({baseUrl,distributionObjKey,useVersionedUrl,versionId}:{baseUrl:string, distributionObjKey?:string, versionId?:string,useVersionedUrl?:boolean}):string {
+        private sendTrace(events: {clientSideId:string, clientSideTsMs:number, type:string, props:object}[]){
+            if(!this._directBaseUrl) return
+            const sessionData = getActiveSessionData(this.params.key, this.envKey)
+            const payload = {
+                visitorId: this._visitorId,
+                sdkName: "cb-client-es-core",
+                sdkVersion: SDK_VERSION,
+                subSdkName: this.params.subSdkName,
+                subSdkVersion: this.params.subSdkVersion,
+                servingVersion: this.getCurrentVersionId(),
+                sessionVersionHash: sessionData?.versionHash,
+                events
+            }
+            const body = typeof btoa !== 'undefined'
+                ? btoa(JSON.stringify(payload))
+                : Buffer.from(JSON.stringify(payload)).toString('base64')
+            const traceUrl = this._directBaseUrl+"a-"+this.params.accountId+"/p-"+this.params.projectId+"/e-"+this.params.environmentId+"/trace"
+            fetch(traceUrl, {method:"POST", headers:{"Content-Type":"text/plain"}, body, keepalive:true}).catch(()=>{})
+        }
+
+                private getHttpPath({baseUrl,distributionObjKey,useVersionedUrl,versionId}:{baseUrl:string, distributionObjKey?:string, versionId?:string,useVersionedUrl?:boolean}):string {
             if(distributionObjKey === undefined){
                 distributionObjKey = this.distributionObjKey
             }
+            let url: string
             if(useVersionedUrl||versionId){
                 const urlVersionId = versionId || getDistObjectCurrentVersionId(this.params.key, distributionObjKey)
                 if(urlVersionId){
-                    return baseUrl+distributionObjKey+"--v-"+urlVersionId+".json"
+                    url = baseUrl+distributionObjKey+"--v-"+urlVersionId+".json"
                 }
             }
-            return baseUrl+distributionObjKey+".json"
+            if(!url){
+                url = baseUrl+distributionObjKey+".json"
+            }
+            return url
         }
 
         private getSSEventsPath({baseUrl}:{baseUrl:string}):string|undefined {
@@ -793,9 +960,9 @@ export namespace ConfigbeeClient {
                 return this.getSessionSSEventsPath({baseUrl})
             }
             if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
-                return baseUrl+this.distributionObjKey+".events?sv="+this.getCurrentVersionId()+"&m=sp"
+                return baseUrl+this.distributionObjKey+".events?sv="+this.getCurrentVersionId()+"&vid="+this._visitorId+"&m=sp"
             }
-            return baseUrl+this.distributionObjKey+".events?sv="+this.getCurrentVersionId()
+            return baseUrl+this.distributionObjKey+".events?sv="+this.getCurrentVersionId()+"&vid="+this._visitorId
         }
         private getSessionSSEventsPath({baseUrl}:{baseUrl:string}):string|undefined {
             const sessionData = getActiveSessionData(this.params.key, this.envKey)
@@ -804,9 +971,9 @@ export namespace ConfigbeeClient {
             }
             const urlPath = baseUrl+"a-"+this.params.accountId+"/p-"+this.params.projectId+"/e-"+this.params.environmentId+"/cs-"+sessionData.key+".events"
             if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
-                return urlPath+"?svh="+sessionData.versionHash+"&m=sp"
+                return urlPath+"?svh="+sessionData.versionHash+"&vid="+this._visitorId+"&m=sp"
             }
-            return urlPath+"?svh="+sessionData.versionHash
+            return urlPath+"?svh="+sessionData.versionHash+"&vid="+this._visitorId
         }
 
         private updateDistributionObj(obj:DistributionObjData,{skipHandleUpdates=false}:{skipHandleUpdates:boolean}={skipHandleUpdates:false}){
@@ -1020,6 +1187,7 @@ export namespace ConfigbeeClient {
 
             this.defaultGroupObjKey = "p-"+params.projectId+"/e-"+params.environmentId+"/cg-"+params.configGroupKey
             this.params = params
+            this._visitorId = getOrCreateVisitorId(params.key, this.distributionObjKey)
 
             if(params.targetProperties!==undefined){
                 this._targetProperties = params.targetProperties
