@@ -3,13 +3,14 @@ import { SDK_VERSION } from "./version";
 import { isInPercentageBucket } from "./utils/percentageBucketing";
 
 declare var localStorage: any;
+declare var global: any;
 declare var navigator: any;
 declare var EventSource: any;
 declare var window: any;
 
-const wait = ms => new Promise(res => setTimeout(res, ms));
+const wait = (ms: number): Promise<void> => new Promise(res => setTimeout(res, ms));
 
-const fetchRetry = (url:string, delay:number, tries:number, fetchOptions:any = {}) => {
+const fetchRetry = (url: string, delay: number, tries: number, fetchOptions: RequestInit = {}): Promise<Response> => {
     function onError(err){
         let triesLeft = tries - 1;
         if(!triesLeft){
@@ -22,23 +23,23 @@ const fetchRetry = (url:string, delay:number, tries:number, fetchOptions:any = {
 
 const ENV_DEFAULT_CONFIG_GROUP_DIST_OBJ_KEY_REGEX = /^p-([0-9A-Fa-f]{4,64})\/e-([0-9A-Fa-f]{4,64})\/cg-default$/
 
-class EventEmitter{
-    private callbacks
-    constructor(){
-        this.callbacks = {}
-    }
+class EventEmitter {
+  private callbacks: {[key: string]: ((data?: any) => void)[]};
+  constructor() {
+    this.callbacks = {};
+  }
 
-    on(event, cb){
-        if(!this.callbacks[event]) this.callbacks[event] = [];
-        this.callbacks[event].push(cb)
-    }
+  on(event: string, cb: (data?: any) => void): void {
+    if (!this.callbacks[event]) this.callbacks[event] = [];
+    this.callbacks[event].push(cb);
+  }
 
-    emit(event, data=undefined){
-        let cbs = this.callbacks[event]
-        if(cbs){
-            cbs.forEach(cb => cb(data))
-        }
+  emit(event: string, data: any = undefined): void {
+    const cbs = this.callbacks[event];
+    if (cbs) {
+      cbs.forEach(cb => cb(data));
     }
+  }
 }
 
 const getStorage = () =>{
